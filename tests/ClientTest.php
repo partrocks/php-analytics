@@ -84,6 +84,93 @@ final class ClientTest extends TestCase
         self::assertSame('{"enabled":false}', $captured[3]['body']);
     }
 
+    public function testReportMethodsUseClientPathsHeadersBodiesAndReturnResults(): void
+    {
+        $captured = [];
+        $result = [
+            'generatedAt' => '2026-09-12T12:00:00+00:00',
+            'columns' => ['day', 'plan', 'logins'],
+            'rows' => [['day' => '2026-09-12', 'plan' => 'pro', 'logins' => 3]],
+        ];
+        $report = [
+            'key' => 'logins-over-time',
+            'name' => 'Logins over time',
+            'metrics' => ['auth.login'],
+            'timeRange' => ['last' => '30d'],
+            'timeBucket' => 'day',
+            'filters' => [['metadata' => 'plan', 'op' => 'eq', 'value' => 'pro']],
+            'groupBy' => ['plan'],
+            'measures' => [['op' => 'count', 'as' => 'logins']],
+        ];
+        $transport = function (string $method, string $url, array $headers, ?string $body) use (&$captured, $report, $result): array {
+            $captured[] = compact('method', 'url', 'headers', 'body');
+            if (str_ends_with($url, '/reports') && 'GET' === $method) {
+                return ['status' => 200, 'body' => '{"reports":[]}'];
+            }
+            if (str_ends_with($url, '/run')) {
+                return ['status' => 200, 'body' => json_encode($result, JSON_THROW_ON_ERROR)];
+            }
+            if ('DELETE' === $method) {
+                return ['status' => 204, 'body' => ''];
+            }
+
+            return [
+                'status' => 'POST' === $method ? 201 : 200,
+                'body' => json_encode(['report' => [...$report, 'createdAt' => 'now', 'updatedAt' => 'now']], JSON_THROW_ON_ERROR),
+            ];
+        };
+        $client = Client::create('pak_test', 'https://analytics.example/', $transport);
+
+        $listed = $client->listReports();
+        $created = $client->createReport($report);
+        $fetched = $client->getReport('customer/report');
+        $updated = $client->updateReport('customer/report', ['name' => 'Customer report']);
+        $client->deleteReport('customer/report');
+        $adHoc = $client->runReportAdHoc($report);
+        $saved = $client->runReport('customer/report');
+
+        self::assertSame([
+            ['GET', 'https://analytics.example/api/v1/reports'],
+            ['POST', 'https://analytics.example/api/v1/reports'],
+            ['GET', 'https://analytics.example/api/v1/reports/customer%2Freport'],
+            ['PATCH', 'https://analytics.example/api/v1/reports/customer%2Freport'],
+            ['DELETE', 'https://analytics.example/api/v1/reports/customer%2Freport'],
+            ['POST', 'https://analytics.example/api/v1/reports/run'],
+            ['POST', 'https://analytics.example/api/v1/reports/customer%2Freport/run'],
+        ], array_map(static fn (array $request): array => [$request['method'], $request['url']], $captured));
+        foreach ($captured as $request) {
+            self::assertSame('application/json', $request['headers']['Accept']);
+            self::assertSame('pak_test', $request['headers']['X-API-Key']);
+        }
+        self::assertSame('application/json', $captured[1]['headers']['Content-Type']);
+        self::assertSame(json_encode($report, JSON_THROW_ON_ERROR), $captured[1]['body']);
+        self::assertSame('{"name":"Customer report"}', $captured[3]['body']);
+        self::assertSame(json_encode($report, JSON_THROW_ON_ERROR), $captured[5]['body']);
+        self::assertNull($captured[6]['body']);
+        self::assertSame(['reports' => []], $listed);
+        self::assertSame($report['key'], $created['report']['key']);
+        self::assertSame($report['key'], $fetched['report']['key']);
+        self::assertSame($report['key'], $updated['report']['key']);
+        self::assertSame($result, $adHoc);
+        self::assertSame($result, $saved);
+    }
+
+    public function testReportErrorsAlwaysThrowIncludingDailyQuotaResponses(): void
+    {
+        $client = Client::create('pak_test', transport: fn (): array => [
+            'status' => 429,
+            'body' => '{"error":"Daily quota exceeded.","code":"daily_quota_exceeded","resetsAt":"2026-09-13T00:00:00+00:00"}',
+        ]);
+
+        try {
+            $client->runReport('logins-over-time');
+            self::fail('Expected PartRocksError');
+        } catch (PartRocksError $error) {
+            self::assertSame(429, $error->status);
+            self::assertSame('daily_quota_exceeded', $error->errorCode);
+        }
+    }
+
     public function testWrapsSuccessfulEventIngest(): void
     {
         $captured = [];
